@@ -79,19 +79,32 @@ enum HaruGGUFInstaller {
         }
         try handle.synchronize()
         await report(.init(sourceBytesRead: sourceBytes, phase: .checking))
-        try handle.seek(toOffset: 0)
-        var hash = SHA256()
-        while let chunk = try handle.read(upToCount: 4 * 1024 * 1024), !chunk.isEmpty {
-            try Task.checkCancellation()
-            hash.update(data: chunk)
-        }
-        let checksum = hash.finalize().map { String(format: "%02x", $0) }.joined()
-        guard checksum == sha256 else {
+        guard try await checksum(of: temporary) == sha256 else {
             try files.removeItem(at: temporary)
             throw HaruError.invalidPack("GGUFのチェックサムが一致しません。ダウンロードし直してください")
         }
+        try Task.checkCancellation()
         if files.fileExists(atPath: final.path) { try files.removeItem(at: final) }
         try files.moveItem(at: temporary, to: final)
         return final
+    }
+
+    @concurrent
+    private static func checksum(of file: URL) async throws -> String {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        var hash = SHA256()
+        while true {
+            try Task.checkCancellation()
+            let hasMoreData = try autoreleasepool {
+                guard let chunk = try handle.read(upToCount: 4 * 1024 * 1024), !chunk.isEmpty else {
+                    return false
+                }
+                hash.update(data: chunk)
+                return true
+            }
+            if !hasMoreData { break }
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
