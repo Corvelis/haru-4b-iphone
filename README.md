@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/ef062366-3294-4b53-9d32-58ea46a0ef98
 
 ## 動作環境
 
-このSDKとサンプルアプリはプレビュー版です。
+このSDKとサンプルアプリはプレビュー版です。標準の音声エンジンはMLXです。speech.cppは実験的なバックエンドで、会話の応答が安定しない場合があります。
 
 - Apple Silicon Mac、Swift 6.3以降を含むXcode、Metal Toolchain。[Xcodeのシステム要件](https://developer.apple.com/xcode/system-requirements/) · [Metal Toolchainの追加](https://developer.apple.com/documentation/xcode/installing-additional-xcode-components)
 - iOS 18以降のiPhone実機。モデルを読み込めるメモリと、次の表に示す保存容量が必要です。
