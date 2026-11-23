@@ -1,0 +1,30 @@
+HaruKit
+Copyright 2026 StackChan Pet Talk contributors
+
+HaruKit is licensed under the Apache License, Version 2.0. The license text
+is included in Haru.txt.
+
+HaruKit includes a Swift adaptation of Haru. See Haru-NOTICE.txt for attribution
+for Haru, the VibeVoice acoustic tokenizer and mlx-lm.
+
+HaruTokenizer.bin is a compact adaptation of the byte IDs and BPE merge rules
+from the Apache-2.0 Haru-4B tokenizer.
+https://huggingface.co/higurashi-ai/Haru-4B/blob/8d6e83bcd3701a76fc27a764965665da1df7da78/tokenizer.json
+
+HaruSpeechCpp is a modified build of speech.cpp 0.11.0 and includes ggml.
+Upstream speech.cpp and ggml are MIT-licensed. See SpeechCpp.txt and GGML.txt.
+ggml includes code derived from Arm Optimized Routines and YaRN.
+See Arm-Optimized-Routines.txt and YaRN.txt.
+The HaruKit modifications are licensed under the Apache License, Version 2.0.
+https://github.com/nyosegawa/speech.cpp/releases/tag/v0.11.0
+https://github.com/jquesnelle/yarn
+
+HaruKit links MLX Swift, MLX C, MLX Core and Swift Numerics. Their licenses
+and applicable third-party notices are included in this directory.
+MLX's NumPy-format loader derives from supervised-lda. See Supervised-LDA.txt.
+https://github.com/angeloskath/supervised-lda
+
+The included Japanese reference clips are fictional voices synthesized with
+Aratako's Irodori-TTS v4.1 Small MF Voice Design using irodori-tts-coreml.
+https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small-MF
+https://github.com/Corvelis/irodori-tts-coreml

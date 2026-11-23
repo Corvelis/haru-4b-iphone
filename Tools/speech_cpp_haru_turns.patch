@@ -1,0 +1,271 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bb52806..bf2da1a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,6 +14,10 @@ endif()
+ option(BUILD_SHARED_LIBS "Build ggml as shared libraries" OFF)
+ # The shared libspeech links the same static libraries as the executables.
+ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++if (APPLE AND HARU_SPEECH_SYMBOL_HEADER)
++    add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=speech.cpp"
++                        "-ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=build")
++endif()
+ # CI builds the submodule's ggml once, installs it with static libraries, and reuses it while the
+ # submodule's commit stays the same; Vulkan's shaders alone take minutes to compile.
+ option(SPEECH_INSTALLED_GGML "Link a ggml installed from the submodule, found through CMAKE_PREFIX_PATH" OFF)
+@@ -226,7 +230,7 @@ add_library(haru STATIC
+     src/families/haru/dialogue.cpp
+     src/families/haru/voice-file.cpp
+ )
+-target_include_directories(haru PUBLIC src/families)
++target_include_directories(haru PUBLIC src/families include)
+ target_link_libraries(haru PUBLIC speechcommon)
+ 
+ # The C API, include/speech.h, twice: static for the executables, so that each stays one file, and shared as
+@@ -254,7 +258,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS include/speech.h)
+ set_target_properties(speech PROPERTIES SOVERSION ${SPEECH_API_VERSION_MAJOR})
+ # ggml's static libraries are built with default visibility, so the linker is told to export the C API alone.
+ if (APPLE)
+-    target_link_options(speech PRIVATE "LINKER:-exported_symbol,_speech_*")
++    if (HARU_SPEECH_SYMBOL_HEADER)
++        target_compile_options(speech PRIVATE -include "${HARU_SPEECH_SYMBOL_HEADER}")
++        target_link_options(speech PRIVATE "LINKER:-exported_symbol,_haru_speech_*")
++    else()
++        target_link_options(speech PRIVATE "LINKER:-exported_symbol,_speech_*")
++    endif()
+ elseif (UNIX)
+     target_link_options(speech PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/api/speech.map")
+     set_property(TARGET speech APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/api/speech.map)
+diff --git a/include/speech.h b/include/speech.h
+index 0a02516..4b945ff 100644
+--- a/include/speech.h
++++ b/include/speech.h
+@@ -1415,6 +1415,24 @@ SPEECH_API void speech_dialogue_free(speech_dialogue * dialogue);
+  */
+ SPEECH_API speech_status speech_dialogue_push(speech_dialogue * dialogue, const float * samples, size_t n_samples);
+ 
++/* Haru for iOS: choose turn-taking for the frames delivered by this push. */
++typedef enum speech_haru_turn {
++    SPEECH_HARU_NORMAL = 0,
++    SPEECH_HARU_LISTENING = 1,
++    SPEECH_HARU_START_REPLY = 2,
++    SPEECH_HARU_CONTINUE_REPLY = 3
++} speech_haru_turn;
++
++typedef enum speech_haru_frame_flag {
++    SPEECH_HARU_TEXT = 1,
++    SPEECH_HARU_END_OF_PAUSE = 2
++} speech_haru_frame_flag;
++
++SPEECH_API speech_status speech_dialogue_push_haru(speech_dialogue * dialogue, const float * samples, size_t n_samples,
++                                                   speech_haru_turn turn);
++/* Read after start or push on the same thread; use the model token before detokenization. */
++SPEECH_API uint32_t speech_dialogue_haru_last_frame_flags(const speech_dialogue * dialogue);
++
+ /**
+  * Ends the conversation: the audio short of a whole frame is dropped, as the model hears whole frames alone. It returns
+  * as speech_dialogue_push() does. Added in 4.2.
+diff --git a/src/api/dialogue.cpp b/src/api/dialogue.cpp
+index 93faaaf..2e56075 100644
+--- a/src/api/dialogue.cpp
++++ b/src/api/dialogue.cpp
+@@ -105,13 +105,21 @@ void speech_dialogue_free(speech_dialogue * dialogue) {
+ }
+ 
+ speech_status speech_dialogue_push(speech_dialogue * dialogue, const float * samples, size_t n_samples) {
++    return speech_dialogue_push_haru(dialogue, samples, n_samples, SPEECH_HARU_NORMAL);
++}
++
++uint32_t speech_dialogue_haru_last_frame_flags(const speech_dialogue * dialogue) {
++    return dialogue && dialogue->stream ? dialogue->stream->haru_last_frame_flags() : 0;
++}
++
++speech_status speech_dialogue_push_haru(speech_dialogue * dialogue, const float * samples, size_t n_samples, speech_haru_turn turn) {
+     return guarded([&] {
+         require(dialogue, "dialogue");
+         if (n_samples > 0) require(samples, "samples", "audio");
+         require_open(*dialogue);
+         return feed(*dialogue, [&] {
+             dialogue->resampler->push(samples, n_samples, dialogue->resampled);
+-            dialogue->stream->push(dialogue->resampled.data(), dialogue->resampled.size());
++            dialogue->stream->push(dialogue->resampled.data(), dialogue->resampled.size(), turn);
+         });
+     });
+ }
+diff --git a/src/engines/engine.h b/src/engines/engine.h
+index acba96b..66cbbb6 100644
+--- a/src/engines/engine.h
++++ b/src/engines/engine.h
+@@ -281,7 +281,8 @@ public:
+     virtual ~DialogueStream() = default;
+ 
+     /** Takes the next `n` samples at the model's rate; false once the sink has asked to stop. */
+-    virtual bool push(const float * samples, size_t n) = 0;
++    virtual bool push(const float * samples, size_t n, speech_haru_turn turn = SPEECH_HARU_NORMAL) = 0;
++    virtual uint32_t haru_last_frame_flags() const = 0;
+ };
+ 
+ /** Where a conversation passes each frame: its audio and its text; false to stop. */
+diff --git a/src/engines/haru-engine.cpp b/src/engines/haru-engine.cpp
+index 8c9fe32..89f8ad0 100644
+--- a/src/engines/haru-engine.cpp
++++ b/src/engines/haru-engine.cpp
+@@ -51,10 +51,13 @@ public:
+     /** Runs the prompt and passes the first frame; the C API learns from its sink whether the caller stopped there. */
+     void start(const std::vector<int32_t> & card, const haru::Voice * voice, const haru::DialogueSettings & s) {
+         const haru::DialogueFrame f = dialogue_->start(card, voice ? voice->means : std::vector<float>(), voice ? voice->quietest : -1, s, random_);
++        flags_ = f.flags;
+         sink_(f.audio.data(), f.audio.size(), f.text);
+     }
+ 
+-    bool push(const float * samples, size_t n) override {
++    uint32_t haru_last_frame_flags() const override { return flags_; }
++
++    bool push(const float * samples, size_t n, speech_haru_turn turn) override {
+         heard_.insert(heard_.end(), samples, samples + n);
+         const size_t frame = (size_t) dialogue_->frame_samples();
+         size_t used = 0;
+@@ -64,8 +67,9 @@ public:
+                 throw Error(Fault::OutOfRange, "the conversation has given the frames of its max_seconds; start a new one with a longer max_seconds to go on",
+                             "max_seconds");
+             }
+-            const haru::DialogueFrame f = dialogue_->step(std::vector<float>(heard_.begin() + (std::ptrdiff_t) used, heard_.begin() + (std::ptrdiff_t) (used + frame)), random_);
++            const haru::DialogueFrame f = dialogue_->step(std::vector<float>(heard_.begin() + (std::ptrdiff_t) used, heard_.begin() + (std::ptrdiff_t) (used + frame)), random_, nullptr, turn);
+             used += frame;
++            flags_ = f.flags;
+             more = sink_(f.audio.data(), f.audio.size(), f.text);
+         }
+         heard_.erase(heard_.begin(), heard_.begin() + (std::ptrdiff_t) used);
+@@ -76,6 +80,7 @@ private:
+     std::unique_ptr<haru::Dialogue> dialogue_;
+     haru::SeededRandomness random_;
+     DialogueSink sink_;
++    uint32_t flags_ = 0;
+     /** The audio heard short of a whole frame. */
+     std::vector<float> heard_;
+ };
+diff --git a/src/families/haru/dialogue.cpp b/src/families/haru/dialogue.cpp
+index 151ec6d..580244d 100644
+--- a/src/families/haru/dialogue.cpp
++++ b/src/families/haru/dialogue.cpp
+@@ -104,15 +104,18 @@ ggml_tensor * Dialogue::project(Graph & g, const std::string & side, ggml_tensor
+ }
+ 
+ ggml_tensor * Dialogue::build_embed(Graph & g, const std::vector<int32_t> & tokens, const std::vector<float> & model, const std::vector<float> & user,
+-                                    const std::vector<float> * model_mask, const std::vector<float> * user_mask) {
++                                    const std::vector<float> * model_mask, const std::vector<float> * user_mask, bool listening) {
+     ggml_context * c = g.ctx();
+     const int64_t n = (int64_t) tokens.size();
+     ggml_tensor * x = ggml_get_rows(c, m_.tensor("token_embd"), g.input(tokens, n));
+     const std::pair<const char *, std::pair<const std::vector<float> *, const std::vector<float> *>> sides[] = {
+         {"model", {&model, model_mask}}, {"user", {&user, user_mask}}};
+-    for (const auto & [side, data] : sides) {
++    const float listening_scales[] = {0.55f, 1.20f};
++    for (size_t i = 0; i < 2; ++i) {
++        const auto & [side, data] = sides[i];
+         ggml_tensor * y = project(g, side, g.input(scaled(*data.first), latent_, n));
+         if (data.second) y = ggml_mul(c, y, g.input(*data.second, 1, n));
++        if (listening) y = ggml_scale(c, y, listening_scales[i]);
+         x = ggml_add(c, x, y);
+     }
+     return x;
+@@ -160,7 +163,7 @@ DialogueFrame Dialogue::start(const std::vector<int32_t> & card, const std::vect
+     return emit(frame, frame.input(std::vector<float>(rows.end() - hidden_, rows.end()), hidden_, 1), r, stages);
+ }
+ 
+-DialogueFrame Dialogue::step(const std::vector<float> & user, Randomness & r, DialogueStages * stages) {
++DialogueFrame Dialogue::step(const std::vector<float> & user, Randomness & r, DialogueStages * stages, speech_haru_turn turn) {
+     if ((int64_t) user.size() != codec_.frame_samples()) {
+         throw Error(Fault::InvalidArgument, "a frame of the user's audio is " + std::to_string(codec_.frame_samples()) + " samples", "audio");
+     }
+@@ -175,11 +178,11 @@ DialogueFrame Dialogue::step(const std::vector<float> & user, Randomness & r, Di
+     }
+     const Clock::time_point building = Clock::now();
+     Graph g;
+-    ggml_tensor * x = build_embed(g, {token_}, latent_last_, latent, nullptr, nullptr);
++    ggml_tensor * x = build_embed(g, {token_}, latent_last_, latent, nullptr, nullptr, turn == SPEECH_HARU_LISTENING);
+     if (stages) g.output(x);
+     ggml_tensor * hidden = decoder_.build_rows(g, x);
+     times_.model += seconds_since(building);
+-    DialogueFrame f = emit(g, hidden, r, stages);
++    DialogueFrame f = emit(g, hidden, r, stages, turn);
+     decoder_.advance(1);
+     if (stages) {
+         const std::vector<float> e = Graph::read(x);
+@@ -188,7 +191,7 @@ DialogueFrame Dialogue::step(const std::vector<float> & user, Randomness & r, Di
+     return f;
+ }
+ 
+-DialogueFrame Dialogue::emit(Graph & g, ggml_tensor * hidden, Randomness & r, DialogueStages * stages) {
++DialogueFrame Dialogue::emit(Graph & g, ggml_tensor * hidden, Randomness & r, DialogueStages * stages, speech_haru_turn turn) {
+     const Clock::time_point computing = Clock::now();
+     std::vector<float> noise((size_t) latent_);
+     r.normal(noise.data(), noise.size());
+@@ -208,7 +211,13 @@ DialogueFrame Dialogue::emit(Graph & g, ggml_tensor * hidden, Randomness & r, Di
+         stages->head_latents.insert(stages->head_latents.end(), z.begin(), z.end());
+     }
+     const Clock::time_point sampling = Clock::now();
+-    shape_logits(l, *dry_, two.data(), ids_, settings_.eop_bias, must_speak_);
++    const bool listening = turn == SPEECH_HARU_LISTENING;
++    shape_logits(l, *dry_, two.data(), ids_, listening ? -1.0f : settings_.eop_bias,
++                 must_speak_ || turn == SPEECH_HARU_CONTINUE_REPLY);
++    if (listening) l[(size_t) ids_.pad] += 1.75f;
++    if (turn == SPEECH_HARU_START_REPLY) {
++        l[(size_t) ids_.pad] = l[(size_t) ids_.eos] = -INFINITY;
++    }
+     must_speak_ = false;
+     DialogueFrame f;
+     f.token = r.token(candidates(l, settings_.sampling));
+@@ -226,6 +235,8 @@ DialogueFrame Dialogue::emit(Graph & g, ggml_tensor * hidden, Randomness & r, Di
+     token_ = f.token;
+     dry_->update(f.token);
+     f.text = detokenizer_->push(f.token);
++    if (f.token >= 0 && f.token < ids_.eos) f.flags |= SPEECH_HARU_TEXT;
++    if (f.token == ids_.eop) f.flags |= SPEECH_HARU_END_OF_PAUSE;
+     frames_++;
+     return f;
+ }
+diff --git a/src/families/haru/dialogue.h b/src/families/haru/dialogue.h
+index 9b91229..9bb6c99 100644
+--- a/src/families/haru/dialogue.h
++++ b/src/families/haru/dialogue.h
+@@ -14,6 +14,7 @@
+ #include "qwen2-tokenizer.h"
+ #include "qwen35-decoder.h"
+ #include "sampler.h"
++#include "speech.h"
+ 
+ namespace haru {
+ 
+@@ -59,6 +60,7 @@ struct DialogueFrame {
+     std::vector<float> audio;
+     int32_t token = 0;
+     std::string text;
++    uint32_t flags = 0;
+ };
+ 
+ /** What a conversation computed on the way, for a check: each in ggml order, appended frame by frame. */
+@@ -120,7 +122,8 @@ public:
+                         Randomness & r, DialogueStages * stages = nullptr);
+ 
+     /** Takes the user's next frame, frame_samples() samples at 24 kHz, and gives the model's next frame. */
+-    DialogueFrame step(const std::vector<float> & user, Randomness & r, DialogueStages * stages = nullptr);
++    DialogueFrame step(const std::vector<float> & user, Randomness & r, DialogueStages * stages = nullptr,
++                       speech_haru_turn turn = SPEECH_HARU_NORMAL);
+ 
+     /** Whether the conversation has given its max_frames frames. */
+     bool done() const { return frames_ >= settings_.max_frames; }
+@@ -136,10 +139,11 @@ private:
+     std::vector<float> scaled(const std::vector<float> & latents) const;
+     /** Builds the input rows of `tokens` with the model's and the user's latents, scaled, each masked where a mask is given. */
+     ggml_tensor * build_embed(Graph & g, const std::vector<int32_t> & tokens, const std::vector<float> & model, const std::vector<float> & user,
+-                              const std::vector<float> * model_mask, const std::vector<float> * user_mask);
++                              const std::vector<float> * model_mask, const std::vector<float> * user_mask, bool listening = false);
+     ggml_tensor * project(Graph & g, const std::string & side, ggml_tensor * latents);
+     /** Gives the frame of the hidden state `hidden`, [hidden, 1], computing the outputs of `g` with it. */
+-    DialogueFrame emit(Graph & g, ggml_tensor * hidden, Randomness & r, DialogueStages * stages);
++    DialogueFrame emit(Graph & g, ggml_tensor * hidden, Randomness & r, DialogueStages * stages,
++                       speech_haru_turn turn = SPEECH_HARU_NORMAL);
+ 
+     const ModelFile & m_;
+     ggml_backend_t backend_;

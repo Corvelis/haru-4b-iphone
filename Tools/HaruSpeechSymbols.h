@@ -1,0 +1,23 @@
+#pragma once
+
+// Keep this framework's C entry points distinct from other speech.cpp SDKs.
+#define speech_dialogue_free haru_speech_dialogue_free
+#define speech_dialogue_haru_last_frame_flags haru_speech_dialogue_haru_last_frame_flags
+#define speech_dialogue_push_haru haru_speech_dialogue_push_haru
+#define speech_dialogue_start haru_speech_dialogue_start
+#define speech_last_error haru_speech_last_error
+#define speech_load_params_free haru_speech_load_params_free
+#define speech_load_params_new haru_speech_load_params_new
+#define speech_load_params_set_device haru_speech_load_params_set_device
+#define speech_load_params_set_warmup haru_speech_load_params_set_warmup
+#define speech_model_free haru_speech_model_free
+#define speech_model_get_info haru_speech_model_get_info
+#define speech_model_info_architecture haru_speech_model_info_architecture
+#define speech_model_info_free haru_speech_model_info_free
+#define speech_model_load haru_speech_model_load
+#define speech_request_free haru_speech_request_free
+#define speech_request_new haru_speech_request_new
+#define speech_request_set_float haru_speech_request_set_float
+#define speech_request_set_int haru_speech_request_set_int
+#define speech_request_set_string haru_speech_request_set_string
+#define speech_voice_add haru_speech_voice_add

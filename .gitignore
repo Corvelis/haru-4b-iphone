@@ -1,0 +1,15 @@
+.DS_Store
+.venv/
+__pycache__/
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.safetensors
+*.gguf
+*.gguf.download
+Haru-JA/
+!/Sources/HaruKit/Resources/HaruTokenizer.bin
+*.ipa
+*.mobileprovision
+Frameworks/
